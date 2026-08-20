@@ -72,7 +72,7 @@ class OLMoEGGUFAdapter(BaseGGUFWeightsAdapter):
 
     @classmethod
     def matches(cls, config) -> bool:
-        return config.model_type == "olmoe"
+        return config.model_type in ["olmoe", "mellum"]
 
     def patch_hf_config(self, model_path: str, hf_config: PretrainedConfig):
         return maybe_patch_hf_config_from_gguf(model_path, hf_config)
