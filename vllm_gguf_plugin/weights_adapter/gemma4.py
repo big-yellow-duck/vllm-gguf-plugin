@@ -8,30 +8,37 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import torch
+from vllm.logger import init_logger
 
-from ..gguf_utils import detect_gguf_multimodal, maybe_patch_hf_config_from_gguf
-from ..weight_utils import (
-    get_gguf_unquantized_params,
-    gguf_quant_weights_iterator_multi,
-)
-from .base import BaseGGUFWeightsAdapter, GGUFLoadSpec
+from ..gguf_files import GGUFModelFiles
+from ..gguf_utils import maybe_patch_hf_config_from_gguf
+from ..weight_utils import get_gguf_tensor_names
+from .base import BaseGGUFWeightsAdapter, GGUFWeight
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
     from vllm.config import ModelConfig
 
+logger = init_logger(__name__)
+
 
 class Gemma4GGUFAdapter(BaseGGUFWeightsAdapter):
     """Adapter for Gemma 4 text and multimodal GGUF models."""
-
-    load_spec = None
 
     @classmethod
     def matches(cls, config) -> bool:
         return config.model_type == "gemma4"
 
-    def patch_hf_config(self, model_path: str, hf_config: PretrainedConfig):
-        return maybe_patch_hf_config_from_gguf(model_path, hf_config)
+    def patch_hf_config(
+        self,
+        files: GGUFModelFiles,
+        hf_config: PretrainedConfig,
+    ) -> PretrainedConfig:
+        return maybe_patch_hf_config_from_gguf(
+            files.primary_backbone,
+            hf_config,
+            mmproj_path=files.mm_proj,
+        )
 
     @staticmethod
     def _map_text_name(name: str) -> str | None:
@@ -124,32 +131,26 @@ class Gemma4GGUFAdapter(BaseGGUFWeightsAdapter):
     def map_name(cls, name: str) -> str | None:
         return cls._map_vision_name(name) or cls._map_text_name(name)
 
-    @staticmethod
-    def _weight_files(model_path: str) -> list[str]:
-        files = [model_path]
-        if mm_proj_path := detect_gguf_multimodal(model_path):
-            files.append(str(mm_proj_path))
-        return files
-
-    def prepare_loading(
+    def build_name_map(
         self,
-        model_path: str,
+        files: GGUFModelFiles,
         model_config: ModelConfig,
-    ) -> GGUFLoadSpec:
-        model_config.hf_config = self.patch_hf_config(
-            model_path, model_config.hf_config
-        )
-        weight_files = self._weight_files(model_path)
-        unquantized_modules = {
-            mapped.rsplit(".", 1)[0] if mapped.endswith(".weight") else mapped
-            for name in get_gguf_unquantized_params(weight_files)
-            if (mapped := self.map_name(name)) is not None
-        }
-        self.load_spec = GGUFLoadSpec(
-            weights_source=weight_files,
-            unquantized_modules=list(unquantized_modules),
-        )
-        return self.load_spec
+    ) -> dict[str, str]:
+        del model_config
+        name_map: dict[str, str] = {}
+        unmapped: list[str] = []
+        for name in sorted(get_gguf_tensor_names(files.all_files)):
+            if mapped := self.map_name(name):
+                name_map[name] = mapped
+            else:
+                unmapped.append(name)
+        if unmapped:
+            logger.warning(
+                "No HF name for %d Gemma 4 GGUF tensor(s), skipping: %s",
+                len(unmapped),
+                unmapped,
+            )
+        return name_map
 
     @staticmethod
     def _split_expert_weights(
@@ -178,16 +179,13 @@ class Gemma4GGUFAdapter(BaseGGUFWeightsAdapter):
             return
         yield name, weight
 
-    def prepare_weights(
+    def transform_weights(
         self,
+        weights: Iterable[GGUFWeight],
         model_config: ModelConfig,
-    ) -> Iterable[tuple[str, torch.Tensor]]:
+    ) -> Iterable[GGUFWeight]:
         del model_config
-        weights = gguf_quant_weights_iterator_multi(self.load_spec.weights_source)
-        for raw_name, weight in weights:
-            name = self.map_name(raw_name)
-            if name is None:
-                continue
+        for name, weight in weights:
             if name == "model.vision_tower.patch_embedder.input_proj.weight":
                 weight = weight.flatten(1)
             yield from self._split_expert_weights(name, weight)
