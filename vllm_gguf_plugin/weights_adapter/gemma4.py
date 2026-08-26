@@ -3,12 +3,12 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import torch
 from vllm.logger import init_logger
+from vllm.model_executor.models.utils import WeightsMapper
 
 from ..gguf_files import GGUFModelFiles
 from ..gguf_utils import maybe_patch_hf_config_from_gguf
@@ -20,6 +20,81 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
 logger = init_logger(__name__)
+
+GEMMA4_TEXT_SUBSTR: dict[str, str] = {
+    "attn_q_norm.": "self_attn.q_norm.",
+    "attn_k_norm.": "self_attn.k_norm.",
+    "attn_q.": "self_attn.q_proj.",
+    "attn_k.": "self_attn.k_proj.",
+    "attn_v.": "self_attn.v_proj.",
+    "attn_output.": "self_attn.o_proj.",
+    "attn_norm.": "input_layernorm.",
+    "post_attention_norm.": "post_attention_layernorm.",
+    "ffn_norm.": "pre_feedforward_layernorm.",
+    "post_ffw_norm_1.": "post_feedforward_layernorm_1.",
+    "post_ffw_norm_2.": "post_feedforward_layernorm_2.",
+    "post_ffw_norm.": "post_feedforward_layernorm.",
+    "pre_ffw_norm_2.": "pre_feedforward_layernorm_2.",
+    "ffn_gate_inp.scale": "router.scale",
+    "ffn_gate_inp.": "router.proj.",
+    "ffn_down_exps.scale": "router.per_expert_scale",
+    "ffn_gate_up_exps.": "experts.0.gate_up_proj.",
+    "ffn_down_exps.": "experts.0.down_proj.",
+    "ffn_gate.": "mlp.gate_proj.",
+    "ffn_up.": "mlp.up_proj.",
+    "ffn_down.": "mlp.down_proj.",
+    "layer_output_scale.weight": "layer_scalar",
+    "layer_output_scale.": "layer_scalar.",
+}
+
+GEMMA4_VISION_SUBSTR: dict[str, str] = {
+    "attn_q_norm.": "self_attn.q_norm.",
+    "attn_k_norm.": "self_attn.k_norm.",
+    "attn_q.": "self_attn.q_proj.linear.",
+    "attn_k.": "self_attn.k_proj.linear.",
+    "attn_v.": "self_attn.v_proj.linear.",
+    "attn_out.": "self_attn.o_proj.linear.",
+    "ffn_gate.": "mlp.gate_proj.linear.",
+    "ffn_up.": "mlp.up_proj.linear.",
+    "ffn_down.": "mlp.down_proj.linear.",
+    "ln1.": "input_layernorm.",
+    "attn_post_norm.": "post_attention_layernorm.",
+    "ln2.": "pre_feedforward_layernorm.",
+    "ffn_post_norm.": "post_feedforward_layernorm.",
+}
+
+
+def build_gemma4_text_mapper() -> WeightsMapper:
+    return WeightsMapper(
+        orig_to_new_prefix={
+            "token_embd.": "model.language_model.embed_tokens.",
+            "blk.": "model.language_model.layers.",
+            "output_norm.": "model.language_model.norm.",
+            "output.": "lm_head.",
+        },
+        orig_to_new_substr=GEMMA4_TEXT_SUBSTR,
+    )
+
+
+def build_gemma4_vision_mapper() -> WeightsMapper:
+    return WeightsMapper(
+        orig_to_new_prefix={
+            "v.position_embd.weight": (
+                "model.vision_tower.patch_embedder.position_embedding_table"
+            ),
+            "v.std_bias": "model.vision_tower.std_bias",
+            "v.std_scale": "model.vision_tower.std_scale",
+            "v.patch_embd.": "model.vision_tower.patch_embedder.input_proj.",
+            "v.blk.": "model.vision_tower.encoder.layers.",
+            "mm.input_projection": "model.embed_vision.embedding_projection",
+        },
+        orig_to_new_substr=GEMMA4_VISION_SUBSTR,
+    )
+
+
+def _map_tensor_name(mapper: WeightsMapper, name: str) -> str | None:
+    mapped = mapper.apply_list([name])[0]
+    return mapped if mapped != name else None
 
 
 class Gemma4GGUFAdapter(BaseGGUFWeightsAdapter):
@@ -41,95 +116,13 @@ class Gemma4GGUFAdapter(BaseGGUFWeightsAdapter):
         )
 
     @staticmethod
-    def _map_text_name(name: str) -> str | None:
-        top_level = {
-            "token_embd": "model.language_model.embed_tokens",
-            "output_norm": "model.language_model.norm",
-            "output": "lm_head",
-        }
-        for gguf_prefix, hf_prefix in top_level.items():
-            if name == gguf_prefix or name.startswith(f"{gguf_prefix}."):
-                return hf_prefix + name.removeprefix(gguf_prefix)
-
-        match = re.fullmatch(r"blk\.(\d+)\.(.+)", name)
-        if match is None:
-            return None
-        layer_idx, suffix = match.groups()
-        layer = f"model.language_model.layers.{layer_idx}"
-        suffix_map = {
-            "attn_q": "self_attn.q_proj",
-            "attn_k": "self_attn.k_proj",
-            "attn_v": "self_attn.v_proj",
-            "attn_output": "self_attn.o_proj",
-            "attn_q_norm": "self_attn.q_norm",
-            "attn_k_norm": "self_attn.k_norm",
-            "attn_norm": "input_layernorm",
-            "post_attention_norm": "post_attention_layernorm",
-            "ffn_norm": "pre_feedforward_layernorm",
-            "post_ffw_norm": "post_feedforward_layernorm",
-            "post_ffw_norm_1": "post_feedforward_layernorm_1",
-            "post_ffw_norm_2": "post_feedforward_layernorm_2",
-            "pre_ffw_norm_2": "pre_feedforward_layernorm_2",
-            "ffn_gate": "mlp.gate_proj",
-            "ffn_up": "mlp.up_proj",
-            "ffn_down": "mlp.down_proj",
-            "ffn_gate_inp": "router.proj",
-            "ffn_gate_inp.scale": "router.scale",
-            "ffn_down_exps.scale": "router.per_expert_scale",
-            "layer_output_scale": "layer_scalar",
-            "layer_output_scale.weight": "layer_scalar",
-            "ffn_gate_up_exps": "experts.0.gate_up_proj",
-            "ffn_down_exps": "experts.0.down_proj",
-        }
-        for gguf_suffix, hf_suffix in sorted(
-            suffix_map.items(), key=lambda item: len(item[0]), reverse=True
-        ):
-            if suffix == gguf_suffix or suffix.startswith(f"{gguf_suffix}."):
-                return layer + "." + hf_suffix + suffix.removeprefix(gguf_suffix)
-        return None
-
-    @staticmethod
-    def _map_vision_name(name: str) -> str | None:
-        if name == "v.position_embd.weight":
-            return "model.vision_tower.patch_embedder.position_embedding_table"
-        direct = {
-            "v.std_bias": "model.vision_tower.std_bias",
-            "v.std_scale": "model.vision_tower.std_scale",
-            "v.patch_embd": "model.vision_tower.patch_embedder.input_proj",
-            "mm.input_projection": "model.embed_vision.embedding_projection",
-        }
-        for gguf_prefix, hf_prefix in direct.items():
-            if name == gguf_prefix or name.startswith(f"{gguf_prefix}."):
-                return hf_prefix + name.removeprefix(gguf_prefix)
-
-        match = re.fullmatch(r"v\.blk\.(\d+)\.(.+)", name)
-        if match is None:
-            return None
-        layer_idx, suffix = match.groups()
-        layer = f"model.vision_tower.encoder.layers.{layer_idx}"
-        suffix_map = {
-            "attn_q": "self_attn.q_proj.linear",
-            "attn_k": "self_attn.k_proj.linear",
-            "attn_v": "self_attn.v_proj.linear",
-            "attn_out": "self_attn.o_proj.linear",
-            "attn_q_norm": "self_attn.q_norm",
-            "attn_k_norm": "self_attn.k_norm",
-            "ffn_gate": "mlp.gate_proj.linear",
-            "ffn_up": "mlp.up_proj.linear",
-            "ffn_down": "mlp.down_proj.linear",
-            "ln1": "input_layernorm",
-            "attn_post_norm": "post_attention_layernorm",
-            "ln2": "pre_feedforward_layernorm",
-            "ffn_post_norm": "post_feedforward_layernorm",
-        }
-        for gguf_suffix, hf_suffix in suffix_map.items():
-            if suffix == gguf_suffix or suffix.startswith(f"{gguf_suffix}."):
-                return layer + "." + hf_suffix + suffix.removeprefix(gguf_suffix)
-        return None
-
-    @classmethod
-    def map_name(cls, name: str) -> str | None:
-        return cls._map_vision_name(name) or cls._map_text_name(name)
+    def map_name(name: str) -> str | None:
+        mapper = (
+            build_gemma4_vision_mapper()
+            if name.startswith(("v.", "mm."))
+            else build_gemma4_text_mapper()
+        )
+        return _map_tensor_name(mapper, name)
 
     def build_name_map(
         self,
@@ -137,10 +130,13 @@ class Gemma4GGUFAdapter(BaseGGUFWeightsAdapter):
         model_config: ModelConfig,
     ) -> dict[str, str]:
         del model_config
+        text_mapper = build_gemma4_text_mapper()
+        vision_mapper = build_gemma4_vision_mapper()
         name_map: dict[str, str] = {}
         unmapped: list[str] = []
         for name in sorted(get_gguf_tensor_names(files.all_files)):
-            if mapped := self.map_name(name):
+            mapper = vision_mapper if name.startswith(("v.", "mm.")) else text_mapper
+            if mapped := _map_tensor_name(mapper, name):
                 name_map[name] = mapped
             else:
                 unmapped.append(name)

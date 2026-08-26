@@ -19,6 +19,11 @@ def test_gemma4_name_mapping():
     assert Gemma4GGUFAdapter.map_name("v.position_embd.weight") == (
         "model.vision_tower.patch_embedder.position_embedding_table"
     )
+    assert Gemma4GGUFAdapter.map_name("v.std_bias") == ("model.vision_tower.std_bias")
+    assert Gemma4GGUFAdapter.map_name("v.std_scale") == ("model.vision_tower.std_scale")
+    assert Gemma4GGUFAdapter.map_name("mm.input_projection.weight") == (
+        "model.embed_vision.embedding_projection.weight"
+    )
     assert Gemma4GGUFAdapter.map_name("rope_freqs.weight") is None
 
 
